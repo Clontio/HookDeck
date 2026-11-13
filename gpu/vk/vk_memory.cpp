@@ -188,10 +188,13 @@ VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size) {
     if (type == UINT32_MAX) {
         VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
         if (vkGetMemoryFdPropertiesKHR(dev.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp) == VK_SUCCESS) {
+            constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            constexpr VkMemoryPropertyFlags kZeroCopy = kHost | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (UMA zero-copy first: device local + host visible + coherent)
+                if ((fp.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & kZeroCopy) == kZeroCopy)
+                    type = i;
             for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (host visible, coherent, first)
-                if ((fp.memoryTypeBits >> i & 1) &&
-                    (dev.memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                if ((fp.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & kHost) == kHost)
                     type = i;
             for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)
                 if (fp.memoryTypeBits >> i & 1) type = i;
@@ -430,10 +433,13 @@ bool import_pool(uint64_t lo, uint64_t hi, Pool& p) {
             import_remember_failure(lo, hi);
             return false;
         }
+        constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        constexpr VkMemoryPropertyFlags kZeroCopy = kHost | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (UMA zero-copy first: device local + host visible + coherent)
+            if ((hp.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & kZeroCopy) == kZeroCopy)
+                type = i;
         for (uint32_t i = 0; i < dev.memory.memoryTypeCount && type == UINT32_MAX; i++)   // (host visible, coherent)
-            if ((hp.memoryTypeBits >> i & 1) &&
-                (dev.memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            if ((hp.memoryTypeBits >> i & 1) && (dev.memory.memoryTypes[i].propertyFlags & kHost) == kHost)
                 type = i;
         if (type == UINT32_MAX) {
             import_remember_failure(lo, hi);
@@ -913,12 +919,13 @@ bool stage_get(Capture& c, size_t need) {   // (a block of at least need bytes i
     c.stage_bytes = c.stage ? sz : 0;
     return c.stage != nullptr;
 }
-void stage_put(Capture& c) {   // (the block back to the kept ones, at most four and 96 MB; else freed)
+void stage_put(Capture& c) {   // (the block back to the kept ones, at most four and 96 MB (32 MB on iGPU); else freed)
     c.sidx.clear();
     if (!c.stage) return;
     std::lock_guard lk(stage_mu);
     static const bool low_spec = env_on("RX_VK_LOW_SPEC");   // (RAM the tight resource there: no block kept)
-    if (!low_spec && stage_free.size() < 4 && stage_free_bytes + c.stage_bytes <= (96ull << 20)) {
+    static const size_t max_bytes = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? (32ull << 20) : (96ull << 20);
+    if (!low_spec && stage_free.size() < 4 && stage_free_bytes + c.stage_bytes <= max_bytes) {
         stage_free_bytes += c.stage_bytes;
         stage_free.emplace_back(std::move(c.stage), c.stage_bytes);
     }
@@ -978,6 +985,7 @@ uint64_t cap_free_bytes = 0;   // (cap_free_mu)
 uint64_t cap_spare_max() {
     static const uint64_t v = [] {
         if (const char* e = getenv("RX_VK_CAP_SPARE_MB")) return e[0] && atoll(e) ? (uint64_t)atoll(e) << 20 : ~0ull;
+        if (dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 64ull << 20;
         uint64_t used = 0, allowed = 0;
         return vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 32ull << 20 : ~0ull;
     }();
@@ -1194,17 +1202,45 @@ bool tex_capture_on() {
 }
 std::vector<std::pair<uint64_t, uint64_t>> tex_cap_ranges;   // (texture storage the capture takes, merged; cap_ranges_mu)
 std::mutex shadow_mu;   // (after pools_mu, before cap_ranges_mu)
+struct ShadowPageSlab {   // (4 KB pages carved from 1 MB slabs and recycled on shadow_mu: avoids 65,536 heap allocations)
+    std::vector<std::unique_ptr<uint8_t[]>> slabs;
+    std::vector<uint8_t*> free_list;
+    size_t used_in_last = 256;
+    uint8_t* alloc() {
+        if (!free_list.empty()) {
+            uint8_t* p = free_list.back();
+            free_list.pop_back();
+            return p;
+        }
+        if (used_in_last >= 256) {
+            slabs.emplace_back(new uint8_t[256 * 4096]);
+            used_in_last = 0;
+        }
+        return slabs.back().get() + (used_in_last++) * 4096;
+    }
+    void free(uint8_t* p) {
+        if (p) free_list.push_back(p);
+    }
+} shadow_slab;
 struct ShadowPage {
-    std::unique_ptr<uint8_t[]> b;
+    struct Ptr {
+        uint8_t* p = nullptr;
+        uint8_t* get() const { return p; }
+        explicit operator bool() const { return p != nullptr; }
+    } b;
     uint64_t seq = 0;   // (the capture that took it)
 };
 std::unordered_map<uint32_t, ShadowPage> shadow;   // guest page -> its 4 KB as the last capture taken had it
 std::unordered_map<uint32_t, uint32_t> shadow_regions;   // (2 MB region -> its pages in the shadow)
 std::atomic<size_t> shadow_n{0};
 uint64_t shadow_seq = 0;   // (captures taken)
-// (256 MB: past it the pages no capture took in the last 64 go, the oldest first: those the game rewrites every frame
+// (256 MB (64 MB on iGPU): past it the pages no capture took in the last 64 go, the oldest first: those the game rewrites every frame
 // stay; if none can go, a page is read from guest memory as before)
 constexpr size_t kShadowMax = 65536;
+size_t shadow_max() {
+    static const size_t m = dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 16384 : kShadowMax;
+    return m;
+}
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> tex_spans;   // lo -> (hi, the present a texture was last uploaded from it)
 std::vector<std::pair<uint64_t, uint64_t>> tex_merged;          // (tex_spans merged; shadow_mu)
 bool tex_spans_changed = false;
@@ -1215,7 +1251,10 @@ bool in_tex_merged(uint64_t guest) {   // (shadow_mu held)
     return it != tex_merged.begin() && guest < std::prev(it)->second;
 }
 void shadow_erase(uint32_t page) {   // (shadow_mu held)
-    if (!shadow.erase(page)) return;
+    auto it = shadow.find(page);
+    if (it == shadow.end()) return;
+    shadow_slab.free(it->second.b.p);
+    shadow.erase(it);
     auto r = shadow_regions.find(page >> 9);
     if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
     shadow_n--;
@@ -1994,6 +2033,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 if (it->second.seq + 256 >= shadow_seq) { ++it; continue; }
                 auto r = shadow_regions.find(it->first >> 9);
                 if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
+                shadow_slab.free(it->second.b.p);
                 it = shadow.erase(it);
                 shadow_n--;
             }
@@ -2018,25 +2058,27 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
             int64_t from_stage = 0, from_map = 0;
             static thread_local std::vector<CopyPair> pairs;   // (the copies, made together once the slots are known)
             pairs.clear();
+            const size_t max_pages = shadow_max();
             size_t i = 0;
             for (; i < c->copied.size(); i++) {
                 const uint32_t p = c->copied[i];
                 if (!in_tex_merged((uint64_t)p << 12)) continue;
-                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !shadow.count(p)) {
+                if (shadow_n.load(std::memory_order_relaxed) >= max_pages && !shadow.count(p)) {
                     if (swept) break;
                     swept = true;
                     for (auto it = shadow.begin(); it != shadow.end();) {
                         if (it->second.seq + 64 >= shadow_seq) { ++it; continue; }
                         auto r = shadow_regions.find(it->first >> 9);
                         if (r != shadow_regions.end() && --r->second == 0) shadow_regions.erase(r);
+                        shadow_slab.free(it->second.b.p);
                         it = shadow.erase(it);
                         shadow_n--;
                     }
-                    if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) break;
+                    if (shadow_n.load(std::memory_order_relaxed) >= max_pages) break;
                 }
                 ShadowPage& slot = shadow[p];
                 if (!slot.b) {
-                    slot.b.reset(new uint8_t[4096]);
+                    slot.b.p = shadow_slab.alloc();
                     shadow_regions[p >> 9]++;
                     shadow_n++;
                 }
@@ -2679,7 +2721,8 @@ void mirror_sync(Pool& p) {
     p.synced_epoch = mirror_epoch;
     p.sync_seg = texture_segment();
     mirror_synced.push_back(&p);
-    std::vector<VkBufferCopy> runs;   // (from guest memory)
+    static thread_local std::vector<VkBufferCopy> runs;   // (from guest memory)
+    runs.clear();
     std::map<VkBuffer, std::vector<VkBufferCopy>> cap_runs;   // (from the captures' copies)
     uint64_t run_lo = 0, run_hi = 0;
     const uint64_t end_page = (p.hi + 4095) >> kPageShift;
@@ -3904,7 +3947,8 @@ bool wb_diff_on() {
     // it). RX_VK_WB_DIFF=0: off
     // (integrated GPUs too: an Ally X's hard reboots stopped with v2.0.8 and came back with v2.0.9's off, issue 997: the whole copies
     // are long submissions there. Its shadows are the system's RAM on them, so at most 512 MB: shadow_room)
-    static const bool on = !getenv("RX_VK_WB_DIFF") || atoi(getenv("RX_VK_WB_DIFF")) != 0;
+    // (only when mirrors are on: without mirrors no write-back ever runs, and tracking written pages only fills shadow_written_pages)
+    static const bool on = (!getenv("RX_VK_WB_DIFF") || atoi(getenv("RX_VK_WB_DIFF")) != 0) && mirror_on();
     return on;
 }
 void shadow_free(Pool& p) {   // (pools_mu held: destroyed once the submissions so far are done)

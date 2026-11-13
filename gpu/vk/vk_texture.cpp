@@ -360,7 +360,14 @@ static void oom_reserve_tend(bool known, uint64_t commit_free, uint64_t reserve)
 #endif
 }
 uint64_t pool_cap() {
-    static const uint64_t mb = getenv("RX_VK_TARGET_POOL_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_TARGET_POOL_MB"))) : 256;
+    static const uint64_t mb = []() -> uint64_t {
+        if (const char* v = getenv("RX_VK_TARGET_POOL_MB")) return (uint64_t)std::max(0, atoi(v));
+        const bool igpu = [](const auto& d) {
+            if constexpr (requires { d.props.deviceType; }) return d.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+            return false;
+        }(dev);
+        return igpu ? 128 : 256;
+    }();
     return mb << 20;
 }
 uint64_t pool_key_of(const VkImageCreateInfo& ci) {
@@ -746,11 +753,13 @@ std::chrono::steady_clock::time_point bc_used_at;
 uint64_t bc_last_value = 0;   // (the recording that last used them: they go once it is done)
 std::atomic<bool> bc_have{false};
 uint32_t bc_idle_s() {
-    // (hookshot) 0 by default again, kept once made: given back after 20 s, the garbled/rainbow textures of 4-8 GB cards followed
+    // (hookshot) 0 by default again on discrete GPUs, kept once made: given back after 20 s, the garbled/rainbow textures of 4-8 GB cards followed
     // (issue 993): every such log has the "given back" line, an RTX 3050 4 GB player's went away with RX_VK_BC_IDLE_S=0 and not with
     // RX_VK_NO_EVICT=1, and they began with v2.0.3, which brought this give-back. Its cost: 160-288 MB of VRAM held after the first
-    // decode. RX_VK_BC_IDLE_S=<seconds>: given back as before
-    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S")) : 0;
+    // decode. On integrated GPUs (UMA) the scratch and its buffer live in shared system RAM and are given back after 30 s idle.
+    // RX_VK_BC_IDLE_S=<seconds>: given back as before
+    static const uint32_t v = getenv("RX_VK_BC_IDLE_S") ? (uint32_t)atoi(getenv("RX_VK_BC_IDLE_S"))
+        : dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 30u : 0u;
     return v;
 }
 bool bc_scratch_make() {   // (bc_mu held)
@@ -1169,7 +1178,8 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         return false;
     }
     const uint64_t tail = layer_size - tail0;
-    std::vector<uint32_t> layers;
+    static thread_local std::vector<uint32_t> layers;
+    layers.clear();
     for (uint32_t layer = 0; layer < tex.layers; layer++)
         if (overlaps(dirty, (uint64_t)layer * layer_size + tail0, (uint64_t)(layer + 1) * layer_size)) layers.push_back(layer);
     if (layers.empty()) return true;
@@ -1179,13 +1189,15 @@ bool upload_astc_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
         astc_fail = "no staging memory for its ASTC blocks";
         return false;
     }
-    std::vector<uint8_t> scratch;
+    static thread_local std::vector<uint8_t> scratch;
+    scratch.clear();
     for (size_t k = 0; k < layers.size(); k++) {
         const uint64_t at = (uint64_t)layers[k] * layer_size + tail0;
         if (at >= total) continue;
         const uint64_t n = std::min(tail, total - at);
         std::memcpy(s.data + k * tail, guest_bytes(tex.gpu + at, n, scratch), n);
     }
+    if (scratch.capacity() > (16u << 20)) std::vector<uint8_t>().swap(scratch);
     const uint64_t staged = tail * layers.size();
     flush_mapped_range(s.allocation, s.offset, staged);   // (encoded blocks read by the GPU decoder, not necessarily coherent)
     st_bytes += (int64_t)staged;
@@ -1747,8 +1759,9 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     const int out_bpb = tex.astc ? 4 : widen_from ? (widen_from == 3 ? 4 : widen_from == 6 ? 8 : 16) : src_bpb;
     const uint32_t copy_layers = tex.type == VK_IMAGE_TYPE_3D ? 1 : tex.layers;
     const VkImageAspectFlags aspect = tex.aspect;
-    std::vector<VkBufferImageCopy> copies;
-    std::vector<uint8_t> scratch, lin;
+    static thread_local std::vector<VkBufferImageCopy> copies;
+    static thread_local std::vector<uint8_t> scratch, lin;
+    copies.clear(), scratch.clear(), lin.clear();
     VkBuffer buffer = VK_NULL_HANDLE;
     for (uint32_t level = 0; level < tex.levels; level++) {
         const LevelGeo g = level_geo(tex, level);
@@ -1763,11 +1776,13 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
             const uint32_t nrows = (g.th + rows_per - 1) / rows_per;
             const uint64_t gobs_x = ((uint64_t)g.tw * src_bpb + 63) / 64;
             const uint64_t row_bytes = gobs_x * (512ull << (g.tile_h + g.tile_d));
-            std::vector<std::pair<uint32_t, uint32_t>> runs;   // (first row, rows)
+            static thread_local std::vector<std::pair<uint32_t, uint32_t>> runs;   // (first row, rows)
+            runs.clear();
             if (!dirty || linear || tex.astc || widen_from || g.td > 1 || g.tile_d) {
                 runs.push_back({0, nrows});
             } else {
-                std::vector<uint8_t> mark(nrows, 0);
+                static thread_local std::vector<uint8_t> mark;
+                mark.assign(nrows, 0);
                 for (const auto& r : *dirty) {
                     const uint64_t lo = std::max(r.first, src_off), hi = std::min(r.second, src_off + span);
                     if (lo >= hi) continue;
@@ -1841,7 +1856,8 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                         const uint32_t chunk = (uint32_t)std::max<uint64_t>(1, (8u << 20) / row_bytes);
                         auto part = [&](uint32_t t) {
                             const uint32_t a0 = t * per, b0 = std::min(nrow, a0 + per);
-                            std::vector<uint8_t> mine;
+                            static thread_local std::vector<uint8_t> mine;
+                            mine.clear();
                             for (uint32_t a = a0; a < b0; a += chunk) {
                                 const uint32_t b = std::min(b0, a + chunk);
                                 const uint32_t h = std::min(th - a * rows_per, (b - a) * rows_per);
@@ -1863,6 +1879,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                                     std::span<uint8_t>(blocks + a * out_row, (uint64_t)g.tw * h * src_bpb),
                                     std::span<const uint8_t>(rows, rows_n), (u32)src_bpb, g.tw, h, 1, g.tile_h, 0, 1);
                             }
+                            if (mine.capacity() > (16u << 20)) std::vector<uint8_t>().swap(mine);
                         };
                         std::vector<std::thread> pool;
                         for (uint32_t t = 1; t < nthreads; t++) pool.emplace_back(part, t);
@@ -4306,7 +4323,8 @@ void compact_step(uint64_t completed) {
         compact.next_check = frame_no + vram_compact::rest(compact.pressed);
         return;
     }
-    std::unordered_map<VmaAllocation, Texture*> by_allocation;
+    static thread_local std::unordered_map<VmaAllocation, Texture*> by_allocation;
+    by_allocation.clear();
     by_allocation.reserve(textures.size());
     for (auto& kv : textures)
         if (kv.second->allocation) by_allocation[kv.second->allocation] = kv.second.get();
@@ -4445,6 +4463,7 @@ void texture_frame(uint64_t completed) {
         // all of Kokiri gameplay, which stages ~nothing. A scene change makes the ones it needs again. RX_VK_STAGING_KEEP_MB=256: as before)
         static const uint64_t keep = []() -> uint64_t {
             if (const char* e = getenv("RX_VK_STAGING_KEEP_MB")) return (uint64_t)atoi(e) << 20;
+            if (dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return 64ull << 20;
             uint64_t used = 0, allowed = 0;
             return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
         }();
@@ -4814,12 +4833,14 @@ void texture_frame(uint64_t completed) {
     static const uint64_t dead_every =
         getenv("RX_VK_DEAD_EVERY") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_DEAD_EVERY"))) : 10;
     if (no_evict || (sweep && frame_no % (dead_targets ? dead_every : 600))) return;
-    std::vector<std::pair<uint64_t, Texture*>> order;
+    static thread_local std::vector<std::pair<uint64_t, Texture*>> order;
+    order.clear();
     order.reserve(textures.size());
     for (auto& kv : textures) order.push_back({kv.second->last_frame, kv.second.get()});
     std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     // (the rendered textures by where their storage starts, for drawn_over_shifted)
-    std::vector<const Texture*> by_start;
+    static thread_local std::vector<const Texture*> by_start;
+    by_start.clear();
     if (dead_targets) {
         for (auto& [last, tex] : order)
             if (tex->gpu_written && tex->first_render_frame && tex->guest_size) by_start.push_back(tex);
@@ -4827,7 +4848,8 @@ void texture_frame(uint64_t completed) {
     }
     uint64_t longest = 0;
     for (const Texture* t : by_start) longest = std::max(longest, t->guest_size);
-    std::unordered_set<Texture*> gone;
+    static thread_local std::unordered_set<Texture*> gone;
+    gone.clear();
     // (over the budget, what goes has gone unused for RX_VK_EVICT_MIN_UNUSED frames, 60 by default; it was 8. On an
     // 8 GB laptop card the VRAM sits at the driver's limit, the budget shrinks and this runs every 10 frames: with 8,
     // ~300 textures in a few minutes of Kokiri Forest were evicted and made again, all of them within 60 frames (200

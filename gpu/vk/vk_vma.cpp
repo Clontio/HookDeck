@@ -268,7 +268,11 @@ bool create_buffer(uint64_t size, VkBufferUsageFlags usage, bool host_visible, V
     bi.usage = usage;
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO;
-    if (host_visible) ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (host_visible) {
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        if (dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)
+            ai.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;   // (UMA zero-copy: HOST_VISIBLE | DEVICE_LOCAL)
+    }
     // (a buffer with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT gets VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT from VMA:
     // vma_init sets VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT)
     static const bool blocks = env_on("RX_VK_BLOCK_BUFFERS");
